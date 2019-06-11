@@ -1,7 +1,7 @@
 import io
 
 from setuptools import setup
-from rofa.__version__ import version
+from __version__ import version
 
 with io.open("README.rst", mode='r', encoding='utf-8') as rm:
     long_description = rm.read()
