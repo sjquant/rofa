@@ -1,14 +1,13 @@
 import io
 
 from setuptools import setup
-from __version__ import version
 
 with io.open("README.rst", mode='r', encoding='utf-8') as rm:
     long_description = rm.read()
 
 setup(
     name='rofa',
-    version=version,
+    version='0.1.2',
     author='SJQuant',
     license="MIT",
     author_email='seonujang92@gmail.com',
