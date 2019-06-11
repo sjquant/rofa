@@ -1,0 +1,20 @@
+# virtual environemt
+.venv
+
+# jupyter notebook checkpoints
+.ipynb_checkpoints
+
+# vscode settings
+.vscode
+
+# data
+data
+
+# python cache files
+**.pyc
+.mypy_cache
+
+#build and dist
+build
+dist
+*.egg-info
