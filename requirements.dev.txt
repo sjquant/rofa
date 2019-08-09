@@ -1,4 +1,4 @@
 jupyter==1.0.0
 flake8
-autopep8
+black
 rope

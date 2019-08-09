@@ -1,2 +1,3 @@
-from .simulator import QuantileSimulator, LongShortSimulator  # noqa
-from .simulator import register_returns  # noqa
+# flake8: noqa
+from .simulator import QuantileSimulator, LongShortSimulator
+from .simulator import register_returns
