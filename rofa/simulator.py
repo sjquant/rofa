@@ -58,11 +58,56 @@ class Simulator:
     def register_app(self, app: Any):
         app.register_simulator(self)
 
-    def _adjust_weights(self) -> pd.DataFrame:
-        raise NotImplementedError
+    def _adjust_weights(
+        self, weighted: pd.DataFrame, long: bool = True
+    ) -> pd.DataFrame:
+        """
+        Adjust weights day by day to reflect on daily change of returns
 
-    def calculate_daily_returns(self):
-        raise NotImplementedError
+        Args:
+            weighted: weighted dataframe
+            long: whether it is for long or short
+        """
+        returns = self.returns[weighted.columns]
+        returns = returns.loc[weighted.index[0] :]
+
+        weighted = weighted.reindex(returns.index)
+
+        sign = 1 if long else -1
+        for i in range(len(weighted)):
+            # if all values are note np.nan,
+            # it is rebalancing weights, so jump to next iteration
+            if not weighted.iloc[i].isnull().all():
+                continue
+
+            # ajdust weights to reflect returns
+            # final_weights are calculated as follows
+            if long:
+                # If long plus return has positive effects on weights
+                affected_weight = weighted.iloc[i - 1] * (1 + returns.iloc[i])
+            else:
+                # otherwise, it has negative effects on weights
+                affected_weight = weighted.iloc[i - 1] * (1 - returns.iloc[i])
+
+            weighted.iloc[i] = affected_weight / affected_weight.sum()
+
+        return sign * weighted
+
+    def calculate_daily_returns(self, weighted: pd.DataFrame) -> pd.Series:
+        """
+        calculate daily returns using weighted and returns
+
+        Args:
+            weighted: weighted dataframe adjusted from `_adjust_weights`
+
+        Returns:
+            daily_returns: daily return dataframe
+        """
+        returns = self.returns[weighted.columns]
+        returns = returns.loc[weighted.index[0] :]
+
+        daily_returns = (weighted.shift(1) * returns).sum(axis=1)
+        return daily_returns
 
     @abc.abstractmethod
     def run(self):
@@ -117,55 +162,6 @@ class QuantileSimulator(Simulator):
             ).prod() - 1
         return self._quarterly_returns
 
-    def _adjust_weights(self, weighted: pd.DataFrame) -> pd.DataFrame:
-        """
-        Adjust weights day by day to reflect on daily change of returns
-
-        Args:
-            weighted: weighted dataframe
-        """
-        returns = self.returns[weighted.columns.get_level_values(1)]
-        # match columns to multiply later
-        returns.columns = weighted.columns
-        returns = returns.loc[weighted.index[0] :]
-
-        weighted = weighted.reindex(returns.index)
-
-        for i in range(len(weighted)):
-            # if all values are not np.nan,
-            # it menas it is rebalancing weights,
-            # so skip turn and jump to the next iteration
-            if not weighted.iloc[i].isnull().all():
-                continue
-
-            # ajdust weights to reflect returns
-            # final_weights are calculated as follows
-            affected_weight = weighted.iloc[i - 1].mul(1 + returns.iloc[i], level=1)
-            weighted.iloc[i] = affected_weight.groupby(level=0).apply(
-                lambda x: x / x.sum()
-            )
-        return weighted
-
-    def calculate_daily_returns(self, weighted: pd.DataFrame) -> pd.Series:
-        """
-        calculate daily returns using weighted and returns
-
-        Args:
-            weighted: weighted dataframe adjusted from `_adjust_weights`
-
-        Returns:
-            daily_returns: daily return dataframe
-        """
-        returns = self.returns[weighted.columns.get_level_values(1)]
-        # match columns to multiply later
-        returns.columns = weighted.columns
-        returns = returns.loc[weighted.index[0] :]
-
-        daily_returns = (
-            weighted.shift(1).mul(returns).groupby(level=0, axis=1).sum(axis=1)
-        )
-        return daily_returns
-
     def _discretize_based_on_quantile(self, data: pd.DataFrame) -> pd.DataFrame:
         # The higher the values, the higher the rank
         rank = data.rank(method="first", axis=1, ascending=True)
@@ -174,6 +170,20 @@ class QuantileSimulator(Simulator):
             lambda x: pd.qcut(x, self.bins, labels), axis=1, raw=True
         )
         return discretized
+
+    def _create_generater(self):
+        data_to_rebalance = self.data.iloc[:: self.rebalance_freq]
+        discretized = self._discretize_based_on_quantile(data_to_rebalance)
+        for i in range(1, self.bins + 1):
+            grouped = data_to_rebalance[~discretized[discretized == i].isnull()]
+            weighted = self.weight_model.calculate(grouped)
+            weights_adjusted = self._adjust_weights(weighted)
+            daily_returns = self.calculate_daily_returns(weights_adjusted)
+            # Apply Tax and Commission
+            daily_returns.loc[data_to_rebalance.index] -= (
+                self.tax_rate + self.commission_rate + self.slippage
+            )
+            yield daily_returns
 
     def calculate_cagr(self):
         cagr = (1 + self.total_returns) ** (DAYS_PER_YEAR / len(self.daily_returns)) - 1
@@ -261,24 +271,11 @@ class QuantileSimulator(Simulator):
 
     def run(self):
         """run simulation"""
+        daily_returns = dict()
+        for i, each in enumerate(self._create_generater()):
+            daily_returns[i + 1] = each
 
-        data_to_rebalance = self.data.iloc[:: self.rebalance_freq]
-        discretized = self._discretize_based_on_quantile(data_to_rebalance)
-
-        weighted = [
-            self.weight_model.calculate(
-                data_to_rebalance[~discretized[discretized == key].isnull()]
-            )
-            for key in range(1, self.bins + 1)
-        ]
-        weighted_concated = pd.concat(weighted, axis=1, keys=range(1, self.bins + 1))
-        weights_adjusted = self._adjust_weights(weighted_concated)
-        daily_returns = self.calculate_daily_returns(weights_adjusted)
-        # Apply Tax and Commission
-        daily_returns.loc[data_to_rebalance.index] -= (
-            self.tax_rate + self.commission_rate + self.slippage
-        )
-        self.daily_returns = daily_returns
+        self.daily_returns = pd.DataFrame(daily_returns)
         self.finished = True
 
 
@@ -334,57 +331,6 @@ class LongShortSimulator(Simulator):
         splited = rank.apply(split_long_short, axis=1)
         return splited
 
-    def _adjust_weights(
-        self, weighted: pd.DataFrame, long: bool = True
-    ) -> pd.DataFrame:
-        """
-        Adjust weights day by day to reflect on daily change of returns
-
-        Args:
-            weighted: weighted dataframe
-            long: whether it is for long or short
-        """
-        returns = self.returns[weighted.columns]
-        returns = returns.loc[weighted.index[0] :]
-
-        weighted = weighted.reindex(returns.index)
-
-        sign = 1 if long else -1
-        for i in range(len(weighted)):
-            # if all values are note np.nan,
-            # it is rebalancing weights, so jump to next iteration
-            if not weighted.iloc[i].isnull().all():
-                continue
-
-            # ajdust weights to reflect returns
-            # final_weights are calculated as follows
-            if long:
-                # If long plus return has positive effects on weights
-                affected_weight = weighted.iloc[i - 1] * (1 + returns.iloc[i])
-            else:
-                # otherwise, it has negative effects on weights
-                affected_weight = weighted.iloc[i - 1] * (1 - returns.iloc[i])
-
-            weighted.iloc[i] = affected_weight / affected_weight.sum()
-
-        return sign * weighted
-
-    def calculate_daily_returns(self, weighted: pd.DataFrame) -> pd.Series:
-        """
-        calculate daily returns using weighted and returns
-
-        Args:
-            weighted: weighted dataframe adjusted from `_adjust_weights`
-
-        Returns:
-            daily_returns: daily return dataframe
-        """
-        returns = self.returns[weighted.columns]
-        returns = returns.loc[weighted.index[0] :]
-
-        daily_returns = (weighted.shift(1) * returns).sum(axis=1)
-        return daily_returns
-
     def run(self):
         """run simulation"""
         data_to_rebalance = self.data.iloc[:: self.rebalance_freq]
@@ -423,4 +369,3 @@ class NakedSimulator(Simulator):
     """
 
     pass
-

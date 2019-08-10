@@ -7,7 +7,7 @@ with io.open("README.rst", mode='r', encoding='utf-8') as rm:
 
 setup(
     name='rofa',
-    version='0.1.3',
+    version='0.1.4',
     author='SJQuant',
     license="MIT",
     author_email='seonujang92@gmail.com',
