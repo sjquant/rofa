@@ -1,5 +1,6 @@
 # virtual environemt
 .venv
+.python-version
 
 # jupyter notebook checkpoints
 .ipynb_checkpoints
