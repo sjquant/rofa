@@ -5,6 +5,14 @@ class SimulationNotFinished(Exception):
         )
 
 
+class SimulationAlreadyRun(Exception):
+    def __init__(self):
+        super().__init__(
+            "Simulation already run once. "
+            "Please create new simulator to run another factor."
+        )
+
+
 class DailyReturnsNotRegistered(Exception):
     def __init__(self):
         super().__init__("Daily returns data have not yet registered.")

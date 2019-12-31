@@ -1,120 +1,131 @@
-from typing import Any, Union, TYPE_CHECKING
+from typing import Union, TYPE_CHECKING
 from functools import lru_cache
 import abc
 import math
-import os
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.axis import Axis
+from matplotlib.dates import date2num
+from pandas.plotting import register_matplotlib_converters
+import seaborn as sns
 
 from .weight_model import EqualWeight
-from .plotter import QuantilePlotter
-from .utils import check_simulation_finished
-from .exceptions import DailyReturnsNotRegistered
+from .exceptions import (
+    DailyReturnsNotRegistered,
+    SimulationNotFinished,
+    SimulationAlreadyRun,
+)
+from .store import Store
+from .logger import logger
+from .constants import TRADING_DAYS_IN_YEAR
+
 
 if TYPE_CHECKING:
     from .weight_model import WeightModel
-DAYS_PER_YEAR = 252
 
-returns = None
-
-
-def register_returns(df: pd.DataFrame, save=True) -> None:
-    global returns
-
-    print("Registering daily returns...")
-    returns = df
-
-    if not os.path.isdir("data"):
-        os.mkdir("data")
-        returns.to_pickle("data/returns.pkl")
-    print("Daily returns were successfuly registerd.")
+sns.set()
+register_matplotlib_converters()
 
 
-class Simulator:
-    def __init__(self, data: pd.DataFrame, rebalance_freq: int, **kwargs):
-        self.data = data
+class BaseSimulator(abc.ABC):
+    def __init__(
+        self,
+        factor: pd.DataFrame,
+        rebalance_freq: int = 20,
+        weight_model: "WeightModel" = EqualWeight(),
+        delay: int = 1,
+        **config,
+    ):
+        self.factor = factor.shift(delay).dropna(how="all")
         self.rebalance_freq = rebalance_freq
-        self.weight_model = kwargs.get("weight_model", None)
-
-        self.commission_rate: float = kwargs.get("commission_rate", 0.00015)
-        self.tax_rate: float = kwargs.get("tax_rate", 0.003)
-        self.slippage: float = kwargs.get("slippage", 0.0)
-
+        self.weight_model = weight_model
+        self.initial_money = 1e7
+        self.commission_rate: float = config.get("commission_rate", 0.00015)
+        self.tax_rate: float = config.get("tax_rate", 0.003)
+        self.slippage: float = config.get("slippage", 0.0)
         self.finished = False
+
+        self._daily_returns = pd.DataFrame()
+        self._cumulative_returns = pd.DataFrame()
+        self._total_returns = pd.DataFrame()
+        self._quarterly_returns = pd.DataFrame()
 
     @property
     @lru_cache()
-    def returns(self):
-        global returns
-
-        if returns is None:
+    def closes(self):
+        store = Store.get()
+        closes = store.closes
+        if closes is None:
             try:
-                returns = pd.read_pickle("data/returns.pkl")
+                closes = pd.read_pickle("data/closes.pkl")
             except FileNotFoundError:
                 raise DailyReturnsNotRegistered
-        return returns
-
-    def register_app(self, app: Any):
-        app.register_simulator(self)
-
-    def _adjust_weights(
-        self, weighted: pd.DataFrame, long: bool = True
-    ) -> pd.DataFrame:
-        """
-        Adjust weights day by day to reflect on daily change of returns
-
-        Args:
-            weighted: weighted dataframe
-            long: whether it is for long or short
-        """
-        returns = self.returns[weighted.columns]
-        returns = returns.loc[weighted.index[0] :]
-
-        weighted = weighted.reindex(returns.index)
-
-        sign = 1 if long else -1
-        for i in range(len(weighted)):
-            # if all values are note np.nan,
-            # it is rebalancing weights, so jump to next iteration
-            if not weighted.iloc[i].isnull().all():
-                continue
-
-            # ajdust weights to reflect returns
-            # final_weights are calculated as follows
-            if long:
-                # If long plus return has positive effects on weights
-                affected_weight = weighted.iloc[i - 1] * (1 + returns.iloc[i])
-            else:
-                # otherwise, it has negative effects on weights
-                affected_weight = weighted.iloc[i - 1] * (1 - returns.iloc[i])
-
-            weighted.iloc[i] = affected_weight / affected_weight.sum()
-
-        return sign * weighted
-
-    def calculate_daily_returns(self, weighted: pd.DataFrame) -> pd.Series:
-        """
-        calculate daily returns using weighted and returns
-
-        Args:
-            weighted: weighted dataframe adjusted from `_adjust_weights`
-
-        Returns:
-            daily_returns: daily return dataframe
-        """
-        returns = self.returns[weighted.columns]
-        returns = returns.loc[weighted.index[0] :]
-
-        daily_returns = (weighted.shift(1) * returns).sum(axis=1)
-        return daily_returns
+        return closes
 
     @abc.abstractmethod
     def run(self):
         pass
 
+    @property
+    def daily_returns(self) -> pd.DataFrame:
+        if not self._daily_returns.empty:
+            return self._daily_returns
+        else:
+            raise SimulationNotFinished("daily_returns")
 
-class QuantileSimulator(Simulator):
+    @daily_returns.setter
+    def daily_returns(self, daily_returns):
+        self._daily_returns = daily_returns
+
+    @property
+    def cumulative_returns(self) -> pd.DataFrame:
+        if self._cumulative_returns.empty:
+            self._cumulative_returns = (self.daily_returns + 1).cumprod() - 1
+        return self._cumulative_returns
+
+    @property
+    def total_returns(self) -> pd.Series:
+        if self._total_returns.empty:
+            self._total_returns = self.cumulative_returns.iloc[-1]
+        return self._total_returns
+
+    @property
+    def quarterly_returns(self) -> pd.DataFrame:
+        if self._quarterly_returns.empty:
+            self._quarterly_returns = (self.daily_returns + 1).groupby(
+                pd.Grouper(freq="Q")
+            ).prod() - 1
+        return self._quarterly_returns
+
+    @abc.abstractmethod
+    def plot_portfolio_returns(self):
+        pass
+
+    @abc.abstractmethod
+    def plot_performance_metrics(self, risk_fre=0.0):
+        pass
+
+    @abc.abstractmethod
+    def plot_rolling_performance(self):
+        pass
+
+    def plot(self, risk_free=0.0, **kwargs):
+        self.plot_portfolio_returns()
+        self.plot_performance_metrics(risk_free)
+        self.plot_rolling_performance()
+
+        save = kwargs.pop("save", False)
+        if save:
+            try:
+                path = kwargs["path"]
+                plt.savefig(path + ".png")
+            except KeyError:
+                raise KeyError("path must be specified to save")
+
+
+class QuantileSimulator(BaseSimulator):
 
     """
     Quantile Simulator divides data into # of bins
@@ -123,44 +134,17 @@ class QuantileSimulator(Simulator):
 
     def __init__(
         self,
-        data: pd.DataFrame,
+        factor: pd.DataFrame,
         rebalance_freq: int = 20,
         weight_model: "WeightModel" = EqualWeight(),
         bins: int = 10,
-        **kwargs
+        delay: int = 1,
+        **config,
     ) -> None:
-        super().__init__(data, rebalance_freq, weight_model=weight_model, **kwargs)
+        super().__init__(factor, rebalance_freq, weight_model, delay, **config)
+        if bins < 0 or bins > 10:
+            raise OverflowError("bins must be integer between 1 and 10")
         self.bins = bins
-
-        self.daily_returns = pd.DataFrame()
-        self._cumulative_returns = pd.DataFrame()
-        self._total_returns = pd.Series()
-        self._quarterly_returns = pd.DataFrame()
-
-        self.plotter = QuantilePlotter(self)
-
-    @property
-    @check_simulation_finished("cumulative_returns")
-    def cumulative_returns(self) -> pd.DataFrame:
-        if self._cumulative_returns.empty:
-            self._cumulative_returns = (self.daily_returns + 1).cumprod() - 1
-        return self._cumulative_returns
-
-    @property
-    @check_simulation_finished("total_returns")
-    def total_returns(self) -> pd.Series:
-        if self._total_returns.empty:
-            self._total_returns = self.cumulative_returns.iloc[-1]
-        return self._total_returns
-
-    @property
-    @check_simulation_finished("quarterly_returns")
-    def quarterly_returns(self) -> pd.DataFrame:
-        if self._quarterly_returns.empty:
-            self._quarterly_returns = (self.daily_returns + 1).groupby(
-                pd.Grouper(freq="Q")
-            ).prod() - 1
-        return self._quarterly_returns
 
     def _discretize_based_on_quantile(self, data: pd.DataFrame) -> pd.DataFrame:
         # The higher the values, the higher the rank
@@ -171,25 +155,46 @@ class QuantileSimulator(Simulator):
         )
         return discretized
 
-    def _create_generater(self):
-        data_to_rebalance = self.data.iloc[:: self.rebalance_freq]
-        discretized = self._discretize_based_on_quantile(data_to_rebalance)
-        for i in range(1, self.bins + 1):
-            grouped = data_to_rebalance[~discretized[discretized == i].isnull()]
-            weighted = self.weight_model.calculate(grouped)
-            weights_adjusted = self._adjust_weights(weighted)
-            daily_returns = self.calculate_daily_returns(weights_adjusted)
-            # Apply Tax and Commission
-            daily_returns.loc[data_to_rebalance.index] -= (
-                self.tax_rate + self.commission_rate + self.slippage
+    def _calculate_port_value(self, weight_df: pd.DataFrame) -> pd.Series:
+        last_port_value = 1e7
+        port_values = []
+        for i in range(len(weight_df)):
+            weights = weight_df.iloc[i].dropna()
+            amount = (last_port_value * weights).divide(
+                self.closes.loc[weights.name, weights.index]
             )
-            yield daily_returns
+            try:
+                next_rebalance_dt = weight_df.iloc[i + 1].name
+                partitioned_closes = self.closes.loc[
+                    weights.name : next_rebalance_dt, weights.index
+                ].iloc[:-1]
+            except IndexError:
+                next_rebalance_dt = self.factor.iloc[-1].name
+                partitioned_closes = self.closes.loc[
+                    weights.name : next_rebalance_dt, weights.index
+                ]
+            amount = (
+                pd.DataFrame(amount)
+                .T.reindex(partitioned_closes.index)
+                .fillna(method="ffill")
+            )
+            partitioned_port_values = partitioned_closes.multiply(amount).sum(axis=1)
+            last_port_value = (
+                self.closes.loc[next_rebalance_dt, weights.index]
+                .multiply(amount.iloc[-1])
+                .sum()
+            )
+            port_values.append(partitioned_port_values)
+        port_values = pd.concat(port_values)
+        return port_values
 
     def calculate_cagr(self):
-        cagr = (1 + self.total_returns) ** (DAYS_PER_YEAR / len(self.daily_returns)) - 1
+        cagr = (1 + self.total_returns) ** (
+            TRADING_DAYS_IN_YEAR / len(self.daily_returns)
+        ) - 1
         return cagr
 
-    def _calculate_adjusted_returns(
+    def calculate_adjusted_returns(
         self, risk_free: Union[float, pd.Series] = 0.0
     ) -> pd.DataFrame:
         if isinstance(risk_free, (int, float)):
@@ -201,16 +206,18 @@ class QuantileSimulator(Simulator):
     def calculate_sharpe_ratio(
         self, risk_free: Union[float, pd.Series] = 0.0
     ) -> pd.Series:
-        adjusted_returns = self._calculate_adjusted_returns(risk_free)
-        ann_avg_returns = adjusted_returns.mean() * DAYS_PER_YEAR
-        ann_returns_std = adjusted_returns.std() * math.sqrt(DAYS_PER_YEAR)
+        adjusted_returns = self.calculate_adjusted_returns(risk_free)
+        ann_avg_returns = adjusted_returns.mean() * TRADING_DAYS_IN_YEAR
+        ann_returns_std = adjusted_returns.std() * math.sqrt(TRADING_DAYS_IN_YEAR)
         sharpe = ann_avg_returns / ann_returns_std
         return sharpe
 
     @lru_cache()
     def calculate_drawdown(self) -> pd.DataFrame:
         roll_max = (
-            (1 + self.cumulative_returns).rolling(DAYS_PER_YEAR, min_periods=1).max()
+            (1 + self.cumulative_returns)
+            .rolling(TRADING_DAYS_IN_YEAR, min_periods=1)
+            .max()
         )
         drawdown = (1 + self.cumulative_returns).divide(roll_max, axis=0) - 1
         return drawdown
@@ -233,14 +240,17 @@ class QuantileSimulator(Simulator):
         window = months * 21
         min_window = min_months * 21
 
-        # rolling_cagr is calculated as folows
+        # rolling_cagr is calculated as follows
         # rolling_returns = rollilng_last_value / rolling_first_value - 1
-        # rooling_cagr = (rolling_returns + 1) ** (DAYS_PER_YEAR/window)
+        # rolling_cagr = (rolling_returns + 1) ** (TRADING_DAYS_IN_YEAR/window)
 
         rolling_cagr = (
             (self.cumulative_returns + 1)
             .rolling(window=window, min_periods=min_window)
-            .apply(lambda x: ((x[-1] / x[0]) ** (DAYS_PER_YEAR / window)) - 1, raw=True)
+            .apply(
+                lambda x: ((x[-1] / x[0]) ** (TRADING_DAYS_IN_YEAR / window)) - 1,
+                raw=True,
+            )
         )
         return rolling_cagr
 
@@ -258,8 +268,8 @@ class QuantileSimulator(Simulator):
                 adjusted_returns = rows - risk_free
             else:
                 adjusted_returns = rows.subtract(risk_free)
-            ann_avg_returns = adjusted_returns.mean() * DAYS_PER_YEAR
-            ann_returns_std = adjusted_returns.std() * math.sqrt(DAYS_PER_YEAR)
+            ann_avg_returns = adjusted_returns.mean() * TRADING_DAYS_IN_YEAR
+            ann_returns_std = adjusted_returns.std() * math.sqrt(TRADING_DAYS_IN_YEAR)
             sharpe = ann_avg_returns / ann_returns_std
             return sharpe
 
@@ -271,101 +281,133 @@ class QuantileSimulator(Simulator):
 
     def run(self):
         """run simulation"""
+        logger.info(f"Start running simulation...")
+        if self.finished:
+            raise SimulationAlreadyRun
         daily_returns = dict()
-        for i, each in enumerate(self._create_generater()):
-            daily_returns[i + 1] = each
-
+        factor_to_rebalance = self.factor.iloc[:: self.rebalance_freq]
+        discretized = self._discretize_based_on_quantile(factor_to_rebalance)
+        for i in range(1, self.bins + 1):
+            logger.info(f"Start bins: {i}")
+            grouped = factor_to_rebalance[~discretized[discretized == i].isnull()]
+            weight_df = self.weight_model.calculate(grouped)
+            port_value = self._calculate_port_value(weight_df)
+            daily_returns[i] = port_value.pct_change()
+            logger.info(f"Finish bins: {i}")
         self.daily_returns = pd.DataFrame(daily_returns)
         self.finished = True
 
-
-class LongShortSimulator(Simulator):
-
-    """
-    Long-Short Simulator picks data top and bottom P%,
-    (which is determined by `ls_percentage` parameter)
-    and long top group and short bottom group.
-    """
-
-    def __init__(
-        self,
-        data: pd.DataFrame,
-        rebalance_freq: int = 20,
-        weight_model: "WeightModel" = EqualWeight(),
-        ls_percentage: float = 0.2,
-        gross_leverage: float = 1.0,
-        **kwargs
+    def _plot_quantile_quarterly_returns(
+        self, ax: Axis, quarterly_returns: pd.DataFrame
     ) -> None:
-        super().__init__(data, rebalance_freq, weight_model=weight_model, **kwargs)
-        self.ls_percentage = ls_percentage
-        self.gross_leverage = gross_leverage
 
-        self.daily_returns = None
-        self._cumulative_returns = None
+        width = 85 / len(quarterly_returns.columns)
 
-    @property
-    @check_simulation_finished("cumulative_returns")
-    def cumulative_returns(self) -> pd.Series:
+        for i, col in enumerate(quarterly_returns.columns):
+            ax.bar(
+                date2num(quarterly_returns.index) + i * width,
+                quarterly_returns[col].values,
+                width=width,
+                color=sns.color_palette()[i],
+                linewidth=0,
+            )
 
-        daily_returns: pd.DataFrame = self.daily_returns
-        if not self._cumulative_returns:
-            self._cumulative_returns = (daily_returns + 1).cumprod() - 1
+        ax.xaxis_date()
+        ax.autoscale(tight=True)
 
-        return self._cumulative_returns
-
-    def _split_long_short(self, data: pd.DataFrame) -> pd.DataFrame:
+    def plot_portfolio_returns(self) -> None:
         """
-        split data into long(1) and short(-1)
-        for certain percentage (ls_percentage)
-        of each long and short
+        plot portfolio returns
+        This method plots 3 axes:
+        1) cumulative returns 2) monthly returns 3) drawdown
         """
-        # The higher the values, the higher the rank
-        rank = data.rank(method="first", axis=1, ascending=True)
+        fig, axes = plt.subplots(nrows=3, ncols=1, sharex=True, figsize=(16, 9))
+        fig.suptitle("Portfolio Returns", fontsize=20)
 
-        def split_long_short(row):
-            count = int(len(row.dropna()) * self.ls_percentage)
-            long = row.nlargest(count).where(row.isnull(), 1)
-            short = row.nsmallest(count).where(row.isnull(), -1)
-            return pd.concat([long, short])
+        axes[0].set_ylabel("Cumulative Returns")
+        axes[1].set_ylabel("Quarterly Returns")
+        axes[2].set_ylabel("Drawdown")
+        cum_returns = self.cumulative_returns * 100
+        quarterly_returns = self.quarterly_returns * 100
+        drawdown = self.calculate_drawdown() * 100
 
-        splited = rank.apply(split_long_short, axis=1)
-        return splited
+        sns.lineplot(data=cum_returns, ax=axes[0], dashes=False)
+        self._plot_quantile_quarterly_returns(axes[1], quarterly_returns)
+        sns.lineplot(data=drawdown, ax=axes[2], dashes=False, legend=False)
+        plt.xlabel("")
+        plt.show()
 
-    def run(self):
-        """run simulation"""
-        data_to_rebalance = self.data.iloc[:: self.rebalance_freq]
-        splited = self._split_long_short(data_to_rebalance)
-        long_data = data_to_rebalance[~splited[splited == 1].isnull()]
-        short_data = data_to_rebalance[~splited[splited == -1].isnull()]
+    def _plot_cagr(self, ax: Axis):
+        cagr = self.calculate_cagr() * 100
+        ax.set_title("CAGR")
+        for i, each in enumerate(cagr.iteritems()):
+            ax.bar(each[0], each[1], color=sns.color_palette()[i], label=each[0])
 
-        # cacluate adjusted weights for long and short
-        long_weighted = self.weight_model.calculate(long_data)
-        short_weighted = self.weight_model.calculate(short_data)
-        long_weights_adjusted = self._adjust_weights(long_weighted)
-        short_weights_adjusted = self._adjust_weights(short_weighted, long=False)
-        # and combined them
-        weights_adjusted = long_weights_adjusted.fillna(short_weights_adjusted) / (
-            2 / self.gross_leverage
-        )
+    def _plot_mdd(self, ax: Axis):
+        mdd = self.calculate_max_drawdown() * 100
+        ax.set_title("MDD")
+        for i, each in enumerate(mdd.iteritems()):
+            ax.bar(each[0], each[1], color=sns.color_palette()[i])
 
-        daily_returns = self.calculate_daily_returns(weights_adjusted)
-        # Apply Tax and Commission
-        daily_returns.loc[data_to_rebalance.index] -= (
-            self.tax_rate + self.commission_rate + self.slippage
-        )
-        self.daily_returns = daily_returns
-        self.finished = True
+    def _plot_sharpe(self, ax: Axis, risk_free: Union[float, pd.Series] = 0):
+        sharpe = self.calculate_sharpe_ratio(risk_free)
+        ax.set_title("Sharpe Ratio")
+        for i, each in enumerate(sharpe.iteritems()):
+            ax.bar(each[0], each[1], color=sns.color_palette()[i])
 
+    def _plot_calmar(self, ax: Axis):
+        calmar = self.calculate_calmar_ratio()
+        ax.set_title("Calmar Ratio")
+        for i, each in enumerate(calmar.iteritems()):
+            ax.bar(each[0], each[1], color=sns.color_palette()[i])
 
-# TODO
-class NakedSimulator(Simulator):
-    """
-    Naked Simulator determine weights and long-short based on values itself.
-    It longs assets with positive value and shorts assetes with negative value,
-    and do nothing with 0 valued assets.
-    It's similar to use QuantileSimulator with OriginalWeightModel, but
-    it does not divides assets into quantile.
-    In that sense, it has some similarity to LongShortSimulator
-    """
+    def plot_performance_metrics(self, risk_free=0.0):
+        """
+        plot performance metrics
+        This method plots 2 x 2 axes:
+        1) CAGR 2) MDD
+        3) Sharpe 4) Calmar
+        """
+        fig, axes = plt.subplots(nrows=2, ncols=2, sharex=True, figsize=(16, 9))
+        fig.suptitle("Performance Metrics", fontsize=20)
 
-    pass
+        self._plot_cagr(axes[0][0])
+        self._plot_mdd(axes[0][1])
+        self._plot_sharpe(axes[1][0], risk_free)
+        self._plot_calmar(axes[1][1])
+        axes[0][0].legend()
+        plt.show()
+
+    def plot_rolling_performance(self):
+        """
+        plot rolling performance
+        This method plots 4 axes:
+        1) 12m rolling cagr
+        2) 36m rolling cagr
+        3) 60m rolling cagr
+        4) 12m rolling sharpe
+        """
+        logger.info("It takes some time to calculate rolling peroformance...")
+
+        fig, axes = plt.subplots(nrows=4, sharex=True, figsize=(16, 9))
+        fig.suptitle("Rolling Performance", fontsize=20)
+
+        cagr_12m = self.calculate_rolling_cagr(12) * 100
+        cagr_36m = self.calculate_rolling_cagr(36) * 100
+        cagr_60m = self.calculate_rolling_cagr(60) * 100
+        sharpe_12m = self.calculate_rolling_sharpe(12)
+
+        axes[0].set_title("Rolling CAGR", fontsize=16)
+        axes[0].set_ylabel("1Y CAGR")
+        axes[1].set_ylabel("3Y CAGR")
+        axes[2].set_ylabel("5Y CAGR")
+        axes[3].set_title("Rolling Sharpe", fontsize=16)
+        axes[3].set_ylabel("1Y Sharpe")
+
+        sns.lineplot(data=cagr_12m, ax=axes[0], dashes=False)
+        sns.lineplot(data=cagr_36m, ax=axes[1], dashes=False, legend=False)
+        sns.lineplot(data=cagr_60m, ax=axes[2], dashes=False, legend=False)
+        sns.lineplot(data=sharpe_12m, ax=axes[3], dashes=False, legend=False)
+        plt.xlabel("")
+        axes[0].legend()
+        plt.show()
